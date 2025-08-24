@@ -31,6 +31,9 @@ fileprivate enum UnityCallback {
     static var onReply:    String = "OnChatGPTReply"
 }
 
+// =======================
+// Speech to Text
+// =======================
 final class SpeechManager {
     static let shared = SpeechManager()
 
@@ -73,8 +76,8 @@ final class SpeechManager {
 
     // 録音開始（入力＋出力を維持）
     func start() throws {
-        stop()              // 前回を完全停止（tap除去まで）
-        engine.reset()      // グラフ初期化
+        stop()
+        engine.reset()
 
         // UI クリア & バッファ初期化
         sendUnity(UnityCallback.gameObject, UnityCallback.onSpeech, "")
@@ -83,24 +86,24 @@ final class SpeechManager {
 
         let session = AVAudioSession.sharedInstance()
 
-        // ★ 重要：出力も生かす
+        // 出力も生かす
         try session.setCategory(.playAndRecord,
                                 mode: .measurement,
                                 options: [.defaultToSpeaker, .allowBluetooth])
 
         // 実機に合わせやすい希望値
         try? session.setPreferredSampleRate(48_000)
+        try? session.setPreferredInputNumberOfChannels(1) // ← モノラル固定で安定化
         try session.setPreferredIOBufferDuration(0.01)
 
-        // Active 化
         try session.setActive(true, options: [])
 
-        // 入力ノードの実フォーマットを取得して tap に渡す
+        // 入力ノードの実フォーマット
         let input = engine.inputNode
         input.removeTap(onBus: 0)
         var tapFormat = input.inputFormat(forBus: 0)
 
-        // まれに 0Hz 対策のリトライ
+        // 0Hz 対策のリトライ
         if tapFormat.sampleRate == 0 {
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
             try? session.setPreferredSampleRate(48_000)
@@ -116,7 +119,7 @@ final class SpeechManager {
         request = SFSpeechAudioBufferRecognitionRequest()
         request?.shouldReportPartialResults = true
 
-        // ★ フォーマットを明示指定
+        // フォーマットを明示指定
         input.installTap(onBus: 0, bufferSize: 1024, format: tapFormat) { [weak self] buf, _ in
             self?.request?.append(buf)
         }
@@ -127,8 +130,8 @@ final class SpeechManager {
         BridgeLog.d("Audio", "REC start sr=\(tapFormat.sampleRate), ch=\(tapFormat.channelCount) / sess sr=\(session.sampleRate), ioBuf=\(session.ioBufferDuration)")
 
         guard let recognizer = recognizer,
-            let req = request,
-            recognizer.isAvailable else {
+              let req = request,
+              recognizer.isAvailable else {
             throw NSError(domain: "Speech", code: -100, userInfo: nil)
         }
 
@@ -154,31 +157,26 @@ final class SpeechManager {
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
 
-        // ★ バッファ供給の終了を明示
         request?.endAudio()
-
         task?.cancel(); task = nil
         request = nil
         isRunning = false
         engine.reset()
-
-        // ★ セッションは落とさない（出力を維持して Unity を安定化）
-        // try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        // セッションは維持
     }
 
-    // 録音の一時停止（今回は使わないが残しておく）
     func pause() {
         guard isRunning else { return }
         engine.pause()
         engine.inputNode.removeTap(onBus: 0)
         isRunning = false
     }
-
-    func resume() {
-        // 「押すまで録音しない」方針にしたので未使用
-    }
+    func resume() { }
 }
 
+// =======================
+// Text to Speech（実測タイミング送出）
+// =======================
 final class TTSManager {
     static let synth = AVSpeechSynthesizer()
 
@@ -190,9 +188,9 @@ final class TTSManager {
     }
 
     static func speak(_ text: String,
-                    lang: String = "ja-JP",
-                    rate: Float = 0.5,
-                    pitch: Float = 1.0)
+                      lang: String = "ja-JP",
+                      rate: Float = 0.5,
+                      pitch: Float = 1.0)
     {
         DispatchQueue.main.async {
             _ = stopSpeaking()
@@ -202,15 +200,13 @@ final class TTSManager {
 
             let session = AVAudioSession.sharedInstance()
             do {
-                // ★ 出力も入力も維持（セッション切替の揺れを最小化）
+                // 出力・入力を維持
                 try session.setCategory(.playAndRecord,
                                         mode: .spokenAudio,
                                         options: [.defaultToSpeaker, .duckOthers, .allowBluetooth])
                 try? session.setPreferredSampleRate(48_000)
                 try? session.setPreferredIOBufferDuration(0.01)
                 try session.setActive(true)
-
-                // スピーカー固定したい場合のみ（BT/有線優先なら外す）
                 try? session.overrideOutputAudioPort(.speaker)
             } catch {
                 print("TTS session error:", error)
@@ -221,49 +217,105 @@ final class TTSManager {
             u.rate  = rate
             u.pitchMultiplier = pitch
 
+            TTSManagerDelegate.shared.resetForNewUtterance(rate: rate)
             synth.delegate = TTSManagerDelegate.shared
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
-                synth.speak(u)
-            }
+            synth.speak(u) // 人為ディレイ廃止：実時間測定を歪めない
         }
     }
 }
 
+// willSpeak の“直前区間”を実時間で確定送出し、最後は didFinish でフラッシュ。
+// これにより「落ちない & 実音声の長さに一致」を保証（区間単位）。
 final class TTSManagerDelegate: NSObject, AVSpeechSynthesizerDelegate {
     static let shared = TTSManagerDelegate()
 
-    func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish utt: AVSpeechUtterance) {
-        // 何もしない
-        // セッションは TTSManager.speak() で設定したまま維持する
+    private var lastRate: Float = 0.5
+
+    // 実時間測定用
+    private var utterStartT: CFTimeInterval = 0
+    private var chunkStartT: CFTimeInterval = 0
+    private var chunkText: String = ""
+    private var seq: Int = 0
+
+    func resetForNewUtterance(rate: Float) {
+        lastRate = rate
+        utterStartT = 0
+        chunkStartT = 0
+        chunkText = ""
+        seq = 0
+    }
+
+    // かな→母音
+    private func vowels(in s: String) -> [String] {
+        let hira = (s as NSString).applyingTransform(.hiraganaToKatakana, reverse: true) ?? s
+        var out: [String] = []
+        for ch in hira {
+            switch ch {
+            case "あ","か","さ","た","な","は","ま","や","ら","わ","が","ざ","だ","ば","ぱ","ぁ","ゃ","ー": out.append("a")
+            case "い","き","し","ち","に","ひ","み","り","ぎ","じ","ぢ","び","ぴ","ぃ": out.append("i")
+            case "う","く","す","つ","ぬ","ふ","む","ゆ","る","ぐ","ず","づ","ぶ","ぷ","ぅ","ゅ": out.append("u")
+            case "え","け","せ","て","ね","へ","め","れ","げ","ぜ","で","べ","ぺ","ぇ": out.append("e")
+            case "お","こ","そ","と","の","ほ","も","よ","ろ","ご","ぞ","ど","ぼ","ぽ","ぉ","ょ": out.append("o")
+            default: break
+            }
+        }
+        return out
+    }
+
+    private func flushCurrent(now: CFTimeInterval, force: Bool = false) {
+        guard !chunkText.isEmpty else { return }
+        var dur = now - chunkStartT
+        if dur < 0 { dur = 0 }           // 時計の単調性担保のため一応
+        if !force && dur < 0.001 { return } // ほぼ同時ならスキップ
+
+        let vs = vowels(in: chunkText)
+        let payload: [String: Any] = [
+            "text": chunkText,
+            "dur": dur,
+            "vowels": vs,
+            "seq": seq
+        ]
+
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let json = String(data: data, encoding: .utf8) {
+            BridgeLog.d("LipRT", String(format:"send seq=%d dur=%.3f text=%@", seq, dur, chunkText))
+            sendUnity(UnityCallback.gameObject, "OnTTSRange", json)
+        }
+        seq &+= 1
+        chunkText = ""
+    }
+
+    // ---- AVSpeechSynthesizerDelegate ----
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didStart u: AVSpeechUtterance) {
+        let now = CACurrentMediaTime()
+        utterStartT = now
+        chunkStartT = now
+        chunkText = "" // まだ未確定
+        seq = 0
+        BridgeLog.d("LipRT", "didStart")
     }
 
     func speechSynthesizer(_ s: AVSpeechSynthesizer,
                            willSpeakRangeOfSpeechString range: NSRange,
-                           utterance: AVSpeechUtterance) {
-        let full = utterance.speechString as NSString
-        let chunk = full.substring(with: range)
+                           utterance u: AVSpeechUtterance)
+    {
+        let now = CACurrentMediaTime()
 
-        let basePerChar: Double = 0.06
-        let duration = max(0.12, min(0.6, Double(chunk.count) * basePerChar))
+        // 1) 直前区間を実時間で確定送出
+        flushCurrent(now: now, force: false)
 
-        let hira = chunk.applyingTransform(.hiraganaToKatakana, reverse: true) ?? chunk
-        let vowels = hira.compactMap { ch -> String? in
-            switch ch {
-            case "あ","か","さ","た","な","は","ま","や","ら","わ","が","ざ","だ","ば","ぱ","ぁ","ゃ","ー": return "a"
-            case "い","き","し","ち","に","ひ","み","り","ぎ","じ","ぢ","び","ぴ","ぃ": return "i"
-            case "う","く","す","つ","ぬ","ふ","む","ゆ","る","ぐ","ず","づ","ぶ","ぷ","ぅ","ゅ": return "u"
-            case "え","け","せ","て","ね","へ","め","れ","げ","ぜ","で","べ","ぺ","ぇ": return "e"
-            case "お","こ","そ","と","の","ほ","も","よ","ろ","ご","ぞ","ど","ぼ","ぽ","ぉ","ょ": return "o"
-            default: return nil
-            }
-        }
+        // 2) 現在区間を開始
+        let full = u.speechString as NSString
+        chunkText = full.substring(with: range)   // 今から読む文字列
+        chunkStartT = now                         // いま開始
+        // （送出は次の willSpeak か didFinish で確定）
+    }
 
-        let payload: [String: Any] = ["text": chunk, "dur": duration, "vowels": vowels]
-        if let data = try? JSONSerialization.data(withJSONObject: payload),
-           let json = String(data: data, encoding: .utf8) {
-            print("[Bridge][Lip] chunk=\(chunk) dur=\(duration) vowels=\(vowels)")
-            sendUnity(UnityCallback.gameObject, "OnTTSRange", json)
-        }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish u: AVSpeechUtterance) {
+        let now = CACurrentMediaTime()
+        // 最後の未送出区間を必ず送る
+        flushCurrent(now: now, force: true)
+        BridgeLog.d("LipRT", "didFinish")
     }
 }
 
@@ -293,8 +345,7 @@ final class ChatGPTWeb: NSObject {
         // 送信開始時に録音を止める
         SpeechManager.shared.stop()
 
-        // ★ 送信「開始時」に UI と内部バッファをクリア
-        // （連続聞き取りでも前回の書き起こしが混ざらない）
+        // 送信「開始時」に UI と内部バッファをクリア
         sendUnity(UnityCallback.gameObject, UnityCallback.onSpeech, "")
         SpeechManager.shared.clearBufferForNextUtterance()
 
@@ -310,7 +361,6 @@ final class ChatGPTWeb: NSObject {
                 return
             }
 
-            // 旧タスク破棄 & リクエストID更新
             self.currentTask?.cancel()
             let reqId = UUID().uuidString
             self.latestRequestId = reqId
@@ -395,7 +445,6 @@ public func ChatGPTBridge_RequestPermissions() {
 @_cdecl("ChatGPTBridge_StartSpeech")
 public func ChatGPTBridge_StartSpeech() {
     DispatchQueue.main.async {
-        // 新規録音前に読み上げを止める
         TTSManager.stopSpeaking()
         do { try SpeechManager.shared.start() }
         catch {
@@ -424,7 +473,6 @@ public func ChatGPTBridge_SetupChatGPT(_ goPtr: UnsafePointer<CChar>, _ methodPt
 
 @_cdecl("ChatGPTBridge_Ask")
 public func ChatGPTBridge_Ask(_ textPtr: UnsafePointer<CChar>) {
-    // 新規送信前に読み上げを止める
     TTSManager.stopSpeaking()
     let question = String(cString: textPtr)
     ChatGPTWeb.shared.ask(question)
