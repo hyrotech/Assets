@@ -14,18 +14,18 @@ public class TTSMouthDriver : MonoBehaviour
     [Header("Motion")]
     [Range(0,100)] public float vowelWeight = 85f;
     [Range(0,100)] public float neutralWeight = 10f;
-    public float minPerVowel = 0.06f;          // 1 音素の最短表示
-    [Range(0f,0.5f)] public float overlap = 0.25f; // 前後オーバーラップ率
-    public float neutralHold = 0.08f;          // 無母音の最短ホールド
+    public float minPerVowel = 0.06f;                // 1 音素の最短表示
+    [Range(0f,0.5f)] public float overlap = 0.25f;   // 前後オーバーラップ率（0で等分）
+    public float neutralHold = 0.08f;                // 無母音の最短ホールド
 
     [Header("Smoothing")]
     public float openTime = 0.04f;
     public float closeTime = 0.09f;
 
     [Header("Sync")]
-    [Tooltip("音声出力の遅延補正（+で口を遅らせる, 単位 ms）")]
-    public float lipDelayMs = -200f;            // ←ここを端末に合わせて ± 調整
-    [Tooltip("minPerVowel未満のチャンクは前の音素と結合する")]
+    [Tooltip("音声出力の遅延補正（+で口を遅らせる, 単位 ms）。全チャンクの開始時刻に一律で適用されます。")]
+    public float lipDelayMs = 120f;
+    [Tooltip("minPerVowel未満のチャンクは前の音素と結合する（“スキップ”はしません）")]
     public bool mergeTooShort = true;
 
     // --- internal state (SmoothDamp) ---
@@ -33,11 +33,18 @@ public class TTSMouthDriver : MonoBehaviour
     float currA,   currI,   currU,   currE,   currO;
     float velA,    velI,    velU,    velE,    velO;
 
-    // --- queue player ---
-    struct LipEvt { public float dur; public List<string> vowels; }
+    // --- scheduler queue ---
+    struct LipEvt
+    {
+        public float dur;
+        public List<string> vowels;
+        public double start;     // 再生予定(絶対)時刻: Time.realtimeSinceStartup ベース
+        public double end;       // 予定終了時刻（デバッグ用）
+    }
     readonly Queue<LipEvt> _queue = new Queue<LipEvt>();
     Coroutine _consumer;
-    float _carry; // 直前から持ち越す短時間
+    double _lastScheduledEnd = -1; // 直前イベントの予定終了（モノトニック化に使用）
+    float _carry;                  // mergeTooShort の持ち越し
 
     void Awake()
     {
@@ -49,7 +56,9 @@ public class TTSMouthDriver : MonoBehaviour
         }
 
         face.updateWhenOffscreen = true;
-        face.quality = SkinQuality.Bone4;
+#if UNITY_6000_1_OR_NEWER
+        face.quality = SkinQuality.Bone4; // 6000系
+#endif
         ResolveVisemeIndices(face.sharedMesh);
 
         var m = face.sharedMesh;
@@ -81,63 +90,92 @@ public class TTSMouthDriver : MonoBehaviour
             vowels = list.Select(x => x?.ToString()).Where(s => !string.IsNullOrEmpty(s)).ToList();
         }
 
-        // ---- enqueue, don't restart the player ----
-        _queue.Enqueue(new LipEvt { dur = dur, vowels = vowels });
+        // ---- スケジューラに投入（絶対時刻を付与）----
+        Schedule(dur, vowels);
 
         if (_consumer == null) _consumer = StartCoroutine(ConsumeQueue());
     }
 
-    // -------------------- Consumer --------------------
+    // 受信したチャンクに「予定時刻」を付けてキューへ
+    void Schedule(float dur, List<string> vowels)
+    {
+        // 一律オフセット（負値はデータ未着のため実質 0 に丸め）
+        double now = Time.realtimeSinceStartupAsDouble;
+        double delay = Mathf.Max(0f, lipDelayMs * 0.001f);
+
+        // 受信時点からの予定開始
+        double scheduledStart = now + delay;
+
+        // モノトニック化：前の予定終了以降に必ず配置
+        if (_lastScheduledEnd > 0 && scheduledStart < _lastScheduledEnd)
+            scheduledStart = _lastScheduledEnd;
+
+        // mergeTooShort: ここで “次の音声データを待って結合” だけを行い、スキップはしない
+        if (mergeTooShort && (vowels != null && vowels.Count > 0))
+        {
+            // 小さすぎる dur は一旦持ち越す（結合ができなければそのまま再生）
+            if (dur + _carry < minPerVowel * vowels.Count && _queue.Count == 0)
+            {
+                _carry += dur;
+                // 予定はキープ（先頭のタイミングを固定したいので）
+                // ただし実チャンクを入れない
+                return;
+            }
+            if (_carry > 0f)
+            {
+                dur += _carry;
+                _carry = 0f;
+            }
+        }
+
+        var e = new LipEvt
+        {
+            dur = Mathf.Max(0.001f, dur),
+            vowels = vowels,
+            start = scheduledStart
+        };
+        e.end = e.start + e.dur;
+
+        _queue.Enqueue(e);
+        _lastScheduledEnd = e.end;
+    }
+
+    // -------------------- Consumer（絶対時刻駆動・音素は絶対にスキップしない） --------------------
     IEnumerator ConsumeQueue()
     {
-        // 全体レイテンシ補正（音声が先に鳴るなら負、遅れて鳴くなら正）
-        float delay = lipDelayMs * 0.001f;
-        if (delay > 0f) yield return new WaitForSecondsRealtime(delay);
-
         while (true)
         {
             if (_queue.Count == 0)
             {
-                // キュー空ならしばらく中立で待機
                 SetNeutralTargets();
                 _consumer = null;
+                _lastScheduledEnd = -1; // 次の発話で再スタート
                 yield break;
             }
 
-            var e = _queue.Dequeue();
-            float dur = e.dur;
+            var e = _queue.Peek();
+            double now = Time.realtimeSinceStartupAsDouble;
 
-            // ①無母音：完全クローズせず基準口でつなぐ
+            // 予定時刻まで待機（Realtime）
+            if (now < e.start)
+            {
+                yield return new WaitForSecondsRealtime((float)(e.start - now));
+                continue; // 予定時刻になったら次ループで確定
+            }
+
+            // ここで実行確定
+            _queue.Dequeue();
+
+            // 無母音：ニュートラルを保つ（閉じ切らない）
             if (e.vowels == null || e.vowels.Count == 0)
             {
                 SetNeutralTargets();
-                yield return new WaitForSecondsRealtime(Mathf.Max(neutralHold, dur));
+                yield return new WaitForSecondsRealtime(Mathf.Max(neutralHold, e.dur));
                 continue;
             }
 
-            // ②短すぎるチャンクは結合
-            if (mergeTooShort)
-            {
-                dur += _carry;
-                _carry = 0f;
-                while (_queue.Count > 0 && dur < minPerVowel * e.vowels.Count)
-                {
-                    var next = _queue.Peek();
-                    if (next.vowels == null || next.vowels.Count == 0) break; // 無母音は別扱い
-                    dur += next.dur;
-                    // vowels を後ろに連結
-                    e.vowels.AddRange(next.vowels);
-                    _queue.Dequeue();
-                }
-                if (dur < minPerVowel * e.vowels.Count)
-                {
-                    _carry = dur; // さらに次回へ持ち越し
-                    continue;
-                }
-            }
-
-            // ③オーバーラップしながら順次ターゲットを更新
-            float per = Mathf.Max(minPerVowel, dur / e.vowels.Count);
+            // 母音を等分（オーバーラップあり）
+            float per = Mathf.Max(minPerVowel, e.dur / e.vowels.Count);
             float step = per * (1f - Mathf.Clamp01(overlap));
 
             for (int i = 0; i < e.vowels.Count; i++)
@@ -147,7 +185,8 @@ public class TTSMouthDriver : MonoBehaviour
             }
 
             // 最後の残り分 + 余韻
-            yield return new WaitForSecondsRealtime(per * Mathf.Clamp01(overlap) + 0.01f);
+            float tail = per * Mathf.Clamp01(overlap);
+            if (tail > 0f) yield return new WaitForSecondsRealtime(tail);
             SetNeutralTargets();
         }
     }
