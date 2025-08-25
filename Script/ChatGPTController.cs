@@ -9,6 +9,7 @@ public class ChatGPTController : MonoBehaviour
     [SerializeField] private TextMeshProUGUI displayText;
     [SerializeField] private Button recordButton;     // 録音トグル
     [SerializeField] private Button sendButton;       // 送信ボタン（Inspectorで割当て推奨）
+    [SerializeField] private TTSPCMPlayer ttsPlayer;  // ★ PCM再生担当（BridgeTarget などに付ける）
 
 #if UNITY_IOS && !UNITY_EDITOR
     [DllImport("__Internal")] private static extern void ChatGPTBridge_SetupSpeech(string target, string method);
@@ -16,7 +17,6 @@ public class ChatGPTController : MonoBehaviour
     [DllImport("__Internal")] private static extern void ChatGPTBridge_StartSpeech();
     [DllImport("__Internal")] private static extern void ChatGPTBridge_StopSpeech();
     [DllImport("__Internal")] private static extern void ChatGPTBridge_Speak(string text);
-    // A案：復活
     [DllImport("__Internal")] private static extern void ChatGPTBridge_SetupChatGPT(string target, string method);
     [DllImport("__Internal")] private static extern void ChatGPTBridge_Ask(string question);
 #else
@@ -33,6 +33,9 @@ public class ChatGPTController : MonoBehaviour
 
     private void Start()
     {
+        // 同じGOに TTSPCMPlayer があれば拾う（Inspector 未設定の保険）
+        if (!ttsPlayer) ttsPlayer = GetComponent<TTSPCMPlayer>();
+
         // 音声入力の受け口
         ChatGPTBridge_SetupSpeech(gameObject.name, nameof(OnSpeechPartial));
         ChatGPTBridge_RequestPermissions();
@@ -54,7 +57,7 @@ public class ChatGPTController : MonoBehaviour
     {
         if (!isRecording)
         {
-            displayText.text = "Listening...";
+            if (displayText) displayText.text = "Listening...";
             ChatGPTBridge_StartSpeech();
             isRecording = true;
         }
@@ -65,13 +68,54 @@ public class ChatGPTController : MonoBehaviour
         }
     }
 
-    // ネイティブ→Unity：音声認識の途中/最終結果（表示のみ・読み上げなし）
+    // ---------- iOS → Unity 受け口 ----------
     public void OnSpeechPartial(string recognizedText)
     {
         if (displayText) displayText.text = recognizedText;
     }
 
-    // 送信：画面のテキストをChatGPTへ
+    public void OnGPTReply(string reply)
+    {
+        if (displayText) displayText.text = reply;
+        // ChatGPTBridge_Speak(reply);
+    }
+
+    public void OnSpeechPermission(string status)
+    {
+        Debug.Log($"[Bridge] Microphone permission: {status}");
+        if (displayText) displayText.text = status == "granted" ? "マイク権限: 許可" : "マイク権限: 拒否";
+    }
+
+    public void OnTTSRange(string json)
+    {
+        Debug.Log("[Unity][Lip] OnTTSRange受信: " + json);
+        if (mouth) mouth.OnTTSRange(json);
+    }
+
+    public void OnSpeechError(string message)
+    {
+        Debug.LogError($"[Bridge] Speech error: {message}");
+        if (displayText) displayText.text = $"音声入力エラー: {message}";
+    }
+
+    // ---------- ★ ここが質問の3メソッド（iOSのPCMストリーム受け口） ----------
+    public void OnTTSStreamBegin(string json)
+    {
+        if (!ttsPlayer) ttsPlayer = GetComponent<TTSPCMPlayer>();
+        if (!ttsPlayer) ttsPlayer = gameObject.AddComponent<TTSPCMPlayer>();
+        ttsPlayer.OnTTSStreamBegin(json);
+    }
+
+    public void OnTTSStreamChunk(string json)
+    {
+        if (ttsPlayer) ttsPlayer.OnTTSStreamChunk(json);
+    }
+
+    public void OnTTSStreamEnd(string json)
+    {
+        if (ttsPlayer) ttsPlayer.OnTTSStreamEnd(json);
+    }
+
     public void SendQuestion()
     {
         var question = displayText ? displayText.text : "";
@@ -80,43 +124,5 @@ public class ChatGPTController : MonoBehaviour
             if (displayText) displayText.text = "Thinking...";
             ChatGPTBridge_Ask(question);
         }
-    }
-
-    // ChatGPT応答：必ず読み上げ
-    public void OnGPTReply(string reply)
-    {
-        if (displayText) displayText.text = reply;
-        //ChatGPTBridge_Speak(reply);   // ← 応答のみ必須で読み上げ
-    }
-
-    public void OnSpeechPermission(string status)
-    {
-        // status: "granted" or "denied" が飛んできます（iOS側実装どおり）
-        Debug.Log($"[Bridge] Microphone permission: {status}");
-
-        if (displayText) displayText.text =
-            status == "granted" ? "マイク権限: 許可" : "マイク権限: 拒否";
-
-        // もし許可されたら自動で録音開始したい場合はコメントアウト外す
-        // if (status == "granted" && !isRecording)
-        // {
-        //     ChatGPTBridge_StartSpeech();
-        //     isRecording = true;
-        // }
-    }
-
-    // これを追加（iOSの willSpeak... → Swift → Unity SendMessage で呼ばれる）
-    public void OnTTSRange(string json)
-    {
-        Debug.Log("[Unity][Lip] OnTTSRange受信: " + json);
-        if (mouth) mouth.OnTTSRange(json);
-    }
-    
-    public void OnSpeechError(string message)
-    {
-        Debug.LogError($"[Bridge] Speech error: {message}");
-        if (displayText) displayText.text = $"音声入力エラー: {message}";
-        // 必要なら録音フラグも落とす
-        // isRecording = false;
     }
 }

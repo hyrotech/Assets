@@ -3,6 +3,7 @@ import UIKit
 import AVFoundation
 import Speech
 import AVFAudio
+import AudioToolbox   // ★ 追加
 
 // ---- Tiny logger ----
 enum BridgeLog {
@@ -29,10 +30,15 @@ fileprivate enum UnityCallback {
     static var gameObject: String = "BridgeTarget"
     static var onSpeech:   String = "OnSpeechPartial"
     static var onReply:    String = "OnChatGPTReply"
+
+    // PCM ストリーミング（Unity 側の受け口）
+    static let onPCMBegin  = "OnTTSStreamBegin"
+    static let onPCMChunk  = "OnTTSStreamChunk"
+    static let onPCMEnd    = "OnTTSStreamEnd"
 }
 
 // =======================
-// Speech to Text
+// Speech to Text（現状そのまま）
 // =======================
 final class SpeechManager {
     static let shared = SpeechManager()
@@ -44,7 +50,6 @@ final class SpeechManager {
 
     private(set) var isRunning = false
 
-    // 発話ごとの一時バッファ
     private(set) var currentTranscript: String = ""
     private var lastFinalText: String?
 
@@ -74,36 +79,25 @@ final class SpeechManager {
         }
     }
 
-    // 録音開始（入力＋出力を維持）
     func start() throws {
         stop()
         engine.reset()
 
-        // UI クリア & バッファ初期化
         sendUnity(UnityCallback.gameObject, UnityCallback.onSpeech, "")
         currentTranscript = ""
         lastFinalText = nil
 
         let session = AVAudioSession.sharedInstance()
-
-        // 出力も生かす
-        try session.setCategory(.playAndRecord,
-                                mode: .measurement,
-                                options: [.defaultToSpeaker, .allowBluetooth])
-
-        // 実機に合わせやすい希望値
+        try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
         try? session.setPreferredSampleRate(48_000)
-        try? session.setPreferredInputNumberOfChannels(1) // ← モノラル固定で安定化
+        try? session.setPreferredInputNumberOfChannels(1)
         try session.setPreferredIOBufferDuration(0.01)
-
         try session.setActive(true, options: [])
 
-        // 入力ノードの実フォーマット
         let input = engine.inputNode
         input.removeTap(onBus: 0)
         var tapFormat = input.inputFormat(forBus: 0)
 
-        // 0Hz 対策のリトライ
         if tapFormat.sampleRate == 0 {
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
             try? session.setPreferredSampleRate(48_000)
@@ -115,11 +109,9 @@ final class SpeechManager {
             throw NSError(domain: "Speech", code: -101, userInfo: [NSLocalizedDescriptionKey:"0Hz input format"])
         }
 
-        // リクエスト作成
         request = SFSpeechAudioBufferRecognitionRequest()
         request?.shouldReportPartialResults = true
 
-        // フォーマットを明示指定
         input.installTap(onBus: 0, bufferSize: 1024, format: tapFormat) { [weak self] buf, _ in
             self?.request?.append(buf)
         }
@@ -152,38 +144,32 @@ final class SpeechManager {
         isRunning = true
     }
 
-    // 録音停止
     func stop() {
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
-
         request?.endAudio()
         task?.cancel(); task = nil
         request = nil
         isRunning = false
         engine.reset()
-        // セッションは維持
     }
-
-    func pause() {
-        guard isRunning else { return }
-        engine.pause()
-        engine.inputNode.removeTap(onBus: 0)
-        isRunning = false
-    }
-    func resume() { }
 }
 
 // =======================
-// Text to Speech（実測タイミング送出）
+// TTS → PCM（iOSでは再生しないでPCMのみ送る）
 // =======================
 final class TTSManager {
     static let synth = AVSpeechSynthesizer()
+
+    private static var currentStreamId: String?
+    private static var sentAnyChunk: Bool = false
 
     @discardableResult
     static func stopSpeaking() -> Bool {
         var stopped = false
         if synth.isSpeaking { stopped = synth.stopSpeaking(at: .immediate) }
+        currentStreamId = nil
+        sentAnyChunk = false
         return stopped
     }
 
@@ -192,24 +178,16 @@ final class TTSManager {
                       rate: Float = 0.5,
                       pitch: Float = 1.0)
     {
-        DispatchQueue.main.async {
+        DispatchQueue.global(qos: .userInitiated).async {
             _ = stopSpeaking()
 
-            // 録音は止める（tap を外す）
-            SpeechManager.shared.stop()
-
+            // iOS 側では出力しない（ただしセッションは有効化）
             let session = AVAudioSession.sharedInstance()
             do {
-                // 出力・入力を維持
-                try session.setCategory(.playAndRecord,
-                                        mode: .spokenAudio,
-                                        options: [.defaultToSpeaker, .duckOthers, .allowBluetooth])
-                try? session.setPreferredSampleRate(48_000)
-                try? session.setPreferredIOBufferDuration(0.01)
+                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
                 try session.setActive(true)
-                try? session.overrideOutputAudioPort(.speaker)
             } catch {
-                print("TTS session error:", error)
+                BridgeLog.e("TTS", "session error \(error.localizedDescription)")
             }
 
             let u = AVSpeechUtterance(string: text)
@@ -217,106 +195,117 @@ final class TTSManager {
             u.rate  = rate
             u.pitchMultiplier = pitch
 
-            TTSManagerDelegate.shared.resetForNewUtterance(rate: rate)
-            synth.delegate = TTSManagerDelegate.shared
-            synth.speak(u) // 人為ディレイ廃止：実時間測定を歪めない
+            let streamId = UUID().uuidString
+            currentStreamId = streamId
+            sentAnyChunk = false
+
+            var sentBegin = false
+            var sr: Double = 0
+            var ch: AVAudioChannelCount = 0
+
+            Self.synth.write(u) { (buffer: AVAudioBuffer) in
+                // 他の発話に切り替わっていたら破棄
+                guard currentStreamId == streamId else { return }
+
+                // 完了マーカー（frameLength == 0）
+                if let pcm = buffer as? AVAudioPCMBuffer, pcm.frameLength == 0 {
+                    DispatchQueue.main.async {
+                        let endPayload: [String: Any] = ["id": streamId]
+                        let data = try? JSONSerialization.data(withJSONObject: endPayload)
+                        let msg = String(data: data ?? Data(), encoding: .utf8) ?? "{}"
+                        sendUnity(UnityCallback.gameObject, UnityCallback.onPCMEnd, msg)
+                    }
+                    return
+                }
+
+                guard let pcmIn = buffer as? AVAudioPCMBuffer else { return }
+                let fmtIn = pcmIn.format
+                sr = fmtIn.sampleRate
+                ch = fmtIn.channelCount
+
+                // ---- 目標: Float32 Interleaved ----
+                var targetDesc = AudioStreamBasicDescription(
+                    mSampleRate: sr,
+                    mFormatID: kAudioFormatLinearPCM,
+                    mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, // ← interleaved
+                    mBytesPerPacket: 4 * ch,
+                    mFramesPerPacket: 1,
+                    mBytesPerFrame: 4 * ch,
+                    mChannelsPerFrame: ch,
+                    mBitsPerChannel: 32,
+                    mReserved: 0
+                )
+                guard let fmtOut = AVAudioFormat(streamDescription: &targetDesc) else { return }
+
+                let needsConvert = !(fmtIn.streamDescription.pointee.mFormatID == fmtOut.streamDescription.pointee.mFormatID
+                                     && fmtIn.channelCount == fmtOut.channelCount
+                                     && fmtIn.sampleRate == fmtOut.sampleRate
+                                     && fmtIn.isInterleaved)
+
+                var pcmOut: AVAudioPCMBuffer = pcmIn
+
+                if needsConvert {
+                    if let conv = AVAudioConverter(from: fmtIn, to: fmtOut) {
+                        let dstCap = AVAudioFrameCount(pcmIn.frameLength)
+                        guard let dst = AVAudioPCMBuffer(pcmFormat: fmtOut, frameCapacity: dstCap) else { return }
+                        var err: NSError?
+                        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+                            outStatus.pointee = .haveData
+                            return pcmIn
+                        }
+                        _ = conv.convert(to: dst, error: &err, withInputFrom: inputBlock)
+                        if let err { BridgeLog.e("PCM", "convert error \(err.localizedDescription)"); return }
+                        pcmOut = dst
+                    } else {
+                        // コンバータが作れない場合は諦めてそのまま（後段で非インターリーブも扱う）
+                        pcmOut = pcmIn
+                    }
+                }
+
+                let frames = Int(pcmOut.frameLength)
+                if frames == 0 { return }
+
+                // Begin（最初のチャンクの前に一度）
+                if !sentBegin {
+                    sentBegin = true
+                    DispatchQueue.main.async {
+                        let payload: [String: Any] = [
+                            "id": streamId,
+                            "sr": sr,
+                            "ch": Int(ch),
+                            "fmt": "f32",
+                            "ilv": true
+                        ]
+                        let data = try? JSONSerialization.data(withJSONObject: payload)
+                        let msg = String(data: data ?? Data(), encoding: .utf8) ?? "{}"
+                        sendUnity(UnityCallback.gameObject, UnityCallback.onPCMBegin, msg)
+                    }
+                }
+
+                // ---- 生バイトの取り出し ----
+                // interleaved なら audioBufferList から mData をそのまま送る
+                let abl = pcmOut.audioBufferList.pointee.mBuffers
+                guard let mData = abl.mData, abl.mDataByteSize > 0 else { return }
+                let byteCount = Int(abl.mDataByteSize)
+
+                let data = Data(bytes: mData, count: byteCount)
+                let b64  = data.base64EncodedString()
+
+                DispatchQueue.main.async {
+                    let payload: [String: Any] = ["id": streamId, "b64": b64, "frames": frames]
+                    let data = try? JSONSerialization.data(withJSONObject: payload)
+                    let msg = String(data: data ?? Data(), encoding: .utf8) ?? "{}"
+                    sendUnity(UnityCallback.gameObject, UnityCallback.onPCMChunk, msg)
+                }
+                sentAnyChunk = true
+            }
         }
     }
 }
 
-// willSpeak の“直前区間”を実時間で確定送出し、最後は didFinish でフラッシュ。
-// これにより「落ちない & 実音声の長さに一致」を保証（区間単位）。
+// === 置き換え: TTSManagerDelegate（不要なら空実装でOK）===
 final class TTSManagerDelegate: NSObject, AVSpeechSynthesizerDelegate {
     static let shared = TTSManagerDelegate()
-
-    private var lastRate: Float = 0.5
-
-    // 実時間測定用
-    private var utterStartT: CFTimeInterval = 0
-    private var chunkStartT: CFTimeInterval = 0
-    private var chunkText: String = ""
-    private var seq: Int = 0
-
-    func resetForNewUtterance(rate: Float) {
-        lastRate = rate
-        utterStartT = 0
-        chunkStartT = 0
-        chunkText = ""
-        seq = 0
-    }
-
-    // かな→母音
-    private func vowels(in s: String) -> [String] {
-        let hira = (s as NSString).applyingTransform(.hiraganaToKatakana, reverse: true) ?? s
-        var out: [String] = []
-        for ch in hira {
-            switch ch {
-            case "あ","か","さ","た","な","は","ま","や","ら","わ","が","ざ","だ","ば","ぱ","ぁ","ゃ","ー": out.append("a")
-            case "い","き","し","ち","に","ひ","み","り","ぎ","じ","ぢ","び","ぴ","ぃ": out.append("i")
-            case "う","く","す","つ","ぬ","ふ","む","ゆ","る","ぐ","ず","づ","ぶ","ぷ","ぅ","ゅ": out.append("u")
-            case "え","け","せ","て","ね","へ","め","れ","げ","ぜ","で","べ","ぺ","ぇ": out.append("e")
-            case "お","こ","そ","と","の","ほ","も","よ","ろ","ご","ぞ","ど","ぼ","ぽ","ぉ","ょ": out.append("o")
-            default: break
-            }
-        }
-        return out
-    }
-
-    private func flushCurrent(now: CFTimeInterval, force: Bool = false) {
-        guard !chunkText.isEmpty else { return }
-        var dur = now - chunkStartT
-        if dur < 0 { dur = 0 }           // 時計の単調性担保のため一応
-        if !force && dur < 0.001 { return } // ほぼ同時ならスキップ
-
-        let vs = vowels(in: chunkText)
-        let payload: [String: Any] = [
-            "text": chunkText,
-            "dur": dur,
-            "vowels": vs,
-            "seq": seq
-        ]
-
-        if let data = try? JSONSerialization.data(withJSONObject: payload),
-           let json = String(data: data, encoding: .utf8) {
-            BridgeLog.d("LipRT", String(format:"send seq=%d dur=%.3f text=%@", seq, dur, chunkText))
-            sendUnity(UnityCallback.gameObject, "OnTTSRange", json)
-        }
-        seq &+= 1
-        chunkText = ""
-    }
-
-    // ---- AVSpeechSynthesizerDelegate ----
-    func speechSynthesizer(_ s: AVSpeechSynthesizer, didStart u: AVSpeechUtterance) {
-        let now = CACurrentMediaTime()
-        utterStartT = now
-        chunkStartT = now
-        chunkText = "" // まだ未確定
-        seq = 0
-        BridgeLog.d("LipRT", "didStart")
-    }
-
-    func speechSynthesizer(_ s: AVSpeechSynthesizer,
-                           willSpeakRangeOfSpeechString range: NSRange,
-                           utterance u: AVSpeechUtterance)
-    {
-        let now = CACurrentMediaTime()
-
-        // 1) 直前区間を実時間で確定送出
-        flushCurrent(now: now, force: false)
-
-        // 2) 現在区間を開始
-        let full = u.speechString as NSString
-        chunkText = full.substring(with: range)   // 今から読む文字列
-        chunkStartT = now                         // いま開始
-        // （送出は次の willSpeak か didFinish で確定）
-    }
-
-    func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish u: AVSpeechUtterance) {
-        let now = CACurrentMediaTime()
-        // 最後の未送出区間を必ず送る
-        flushCurrent(now: now, force: true)
-        BridgeLog.d("LipRT", "didFinish")
-    }
 }
 
 // =======================
