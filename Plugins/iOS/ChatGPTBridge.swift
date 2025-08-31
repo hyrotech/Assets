@@ -173,9 +173,35 @@ final class TTSManager {
         return stopped
     }
 
+    // quality==1（Enhanced）のみを選ぶ。優先順位:
+    // 1) Siri O-ren のフル版（_compact なし）
+    // 2) Siri O-ren の compact 版
+    // 3) それ以外の ja-JP Enhanced
+    // 4) 最後の手段として言語指定（qualityは問わない）
+    private static func pickEnhancedJapaneseVoice() -> AVSpeechSynthesisVoice? {
+        let all = AVSpeechSynthesisVoice.speechVoices()
+        let jaEnhanced = all.filter { $0.language.hasPrefix("ja") && $0.quality == .enhanced }
+
+        // 情報ログ（デバッグに役立つ）
+        for v in all.filter({ $0.language.hasPrefix("ja") }) {
+            BridgeLog.d("TTS", "id=\(v.identifier) name=\(v.name) quality=\(v.quality.rawValue)")
+        }
+
+        if let v = jaEnhanced.first(where: { $0.identifier == "com.apple.ttsbundle.siri_oren_ja-JP" }) {
+            return v
+        }
+        if let v = jaEnhanced.first(where: { $0.identifier == "com.apple.ttsbundle.siri_oren_ja-JP_compact" }) {
+            return v
+        }
+        if let v = jaEnhanced.first {
+            return v
+        }
+        return AVSpeechSynthesisVoice(language: "ja-JP")
+    }
+
     static func speak(_ text: String,
                       lang: String = "ja-JP",
-                      rate: Float = 0.5,
+                      rate: Float = AVSpeechUtteranceDefaultSpeechRate, // 既定レート
                       pitch: Float = 1.0)
     {
         DispatchQueue.global(qos: .userInitiated).async {
@@ -190,10 +216,20 @@ final class TTSManager {
                 BridgeLog.e("TTS", "session error \(error.localizedDescription)")
             }
 
+            // ---- Utterance 準備：quality==1（Enhanced）固定 ----
             let u = AVSpeechUtterance(string: text)
-            u.voice = AVSpeechSynthesisVoice(language: lang)
-            u.rate  = rate
+
+            let selected = pickEnhancedJapaneseVoice()
+            if let v = selected {
+                u.voice = v
+                BridgeLog.d("TTS", "use voice name=\(v.name) id=\(v.identifier) quality=\(v.quality.rawValue)")
+            } else {
+                BridgeLog.e("TTS", "no enhanced ja-JP voice found; falling back to system default")
+            }
+
+            u.rate = AVSpeechUtteranceDefaultSpeechRate
             u.pitchMultiplier = pitch
+            BridgeLog.d("TTS", "final rate=\(u.rate), pitch=\(u.pitchMultiplier)")
 
             let streamId = UUID().uuidString
             currentStreamId = streamId
@@ -203,14 +239,18 @@ final class TTSManager {
             var sr: Double = 0
             var ch: AVAudioChannelCount = 0
 
+            // ★ 追加: チャンク通番（Begin=0, 各Chunkで+1, Endにも載せる）
+            var seq: Int = 0
+
             Self.synth.write(u) { (buffer: AVAudioBuffer) in
                 // 他の発話に切り替わっていたら破棄
                 guard currentStreamId == streamId else { return }
 
                 // 完了マーカー（frameLength == 0）
                 if let pcm = buffer as? AVAudioPCMBuffer, pcm.frameLength == 0 {
+                    let endSeq = seq // 現在の通番を End にも載せる
                     DispatchQueue.main.async {
-                        let endPayload: [String: Any] = ["id": streamId]
+                        let endPayload: [String: Any] = ["id": streamId, "seq": endSeq]
                         let data = try? JSONSerialization.data(withJSONObject: endPayload)
                         let msg = String(data: data ?? Data(), encoding: .utf8) ?? "{}"
                         sendUnity(UnityCallback.gameObject, UnityCallback.onPCMEnd, msg)
@@ -227,7 +267,7 @@ final class TTSManager {
                 var targetDesc = AudioStreamBasicDescription(
                     mSampleRate: sr,
                     mFormatID: kAudioFormatLinearPCM,
-                    mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, // ← interleaved
+                    mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, // interleaved
                     mBytesPerPacket: 4 * ch,
                     mFramesPerPacket: 1,
                     mBytesPerFrame: 4 * ch,
@@ -243,7 +283,6 @@ final class TTSManager {
                                      && fmtIn.isInterleaved)
 
                 var pcmOut: AVAudioPCMBuffer = pcmIn
-
                 if needsConvert {
                     if let conv = AVAudioConverter(from: fmtIn, to: fmtOut) {
                         let dstCap = AVAudioFrameCount(pcmIn.frameLength)
@@ -268,9 +307,11 @@ final class TTSManager {
                 // Begin（最初のチャンクの前に一度）
                 if !sentBegin {
                     sentBegin = true
+                    let beginSeq = seq
                     DispatchQueue.main.async {
                         let payload: [String: Any] = [
                             "id": streamId,
+                            "seq": beginSeq,
                             "sr": sr,
                             "ch": Int(ch),
                             "fmt": "f32",
@@ -280,23 +321,25 @@ final class TTSManager {
                         let msg = String(data: data ?? Data(), encoding: .utf8) ?? "{}"
                         sendUnity(UnityCallback.gameObject, UnityCallback.onPCMBegin, msg)
                     }
+                    seq += 1
                 }
 
                 // ---- 生バイトの取り出し ----
-                // interleaved なら audioBufferList から mData をそのまま送る
                 let abl = pcmOut.audioBufferList.pointee.mBuffers
                 guard let mData = abl.mData, abl.mDataByteSize > 0 else { return }
                 let byteCount = Int(abl.mDataByteSize)
 
-                let data = Data(bytes: mData, count: byteCount)
-                let b64  = data.base64EncodedString()
+                let raw = Data(bytes: mData, count: byteCount)
+                let b64  = raw.base64EncodedString()
 
+                let chunkSeq = seq
                 DispatchQueue.main.async {
-                    let payload: [String: Any] = ["id": streamId, "b64": b64, "frames": frames]
+                    let payload: [String: Any] = ["id": streamId, "seq": chunkSeq, "b64": b64, "frames": frames]
                     let data = try? JSONSerialization.data(withJSONObject: payload)
                     let msg = String(data: data ?? Data(), encoding: .utf8) ?? "{}"
                     sendUnity(UnityCallback.gameObject, UnityCallback.onPCMChunk, msg)
                 }
+                seq += 1
                 sentAnyChunk = true
             }
         }
